@@ -13,6 +13,7 @@ apply plugin: 'kotlin'
 
 repositories {
     mavenCentral()
+    jcenter()
     maven { url 'https://jitpack.io' }
 }
 
@@ -34,7 +35,8 @@ configurations {
 
 dependencies {
     ktlint 'com.github.shyiko:ktlint:0.9.1'
-    implementation 'com.github.wardellbagby:CachingSequence:0.1.1'
+    implementation 'com.github.wardellbagby:CachingSequence:0.1.2'
+    implementation 'com.yundom:kache:1.0.1'
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk8:$kotlin_version"
     testImplementation 'junit:junit:4.12'
 }

@@ -1,6 +1,10 @@
 package com.wardellbagby.weightedshuffle
 
 import com.wardellbagby.cachingsequence.CachingSequence
+import com.yundom.kache.Builder
+import com.yundom.kache.Kache
+import com.yundom.kache.config.FIFO
+import java.util.*
 import kotlin.coroutines.experimental.buildSequence
 
 /**
@@ -24,10 +28,10 @@ object WeightedShuffle {
     /**
      * Data class representing an item for this shuffle, along with its weight.
      *
-     * @property item the underlying item.
-     * @property weight the weight of the item.
+     * @property value the underlying item.
+     * @property key the key for this item.
      */
-    private data class WeightedValue<out ValueT>(val weight: Long, val item: ValueT, var skippedCount: Long = 0)
+    private data class KeyValue<out ValueT, out KeyT>(val key: KeyT, val value: ValueT, var skippedCount: Long = 0)
 
     /**
      * Generate indexes for the given list that when accessed sequentially as indexes in [values], will
@@ -98,13 +102,12 @@ object WeightedShuffle {
         if (valuesCopy.isEmpty()) throw IllegalArgumentException("values is empty.")
         if (valuesCopy.size <= drop) throw IllegalArgumentException("drop is greater than or equal to the size of values. size: ${valuesCopy.size}; drop: $drop")
 
-        val totalCount = valuesCopy.count() - drop //Hold the total amount of queued items now.
         val droppedValues = valuesCopy.take(drop).mapIndexed { index, item -> IndexedValue(index, item) }.map(yieldMapper).asSequence()
-        //We need to make sure the weights aren't going to be too low to get any kind of accuracy, so take the nearest higher power of 10 from totalCount.
-        val totalWeight = Math.pow(10.0, Math.ceil(Math.log10(totalCount.toDouble()))).toLong()
+
         val keyMappedItems = convertToMap(valuesCopy.drop(drop), weightedBy)
-        val weightedItems = convertToWeightedPairs(keyMappedItems, totalCount, totalWeight)
-        return CachingSequence(droppedValues + generateShuffledSequence(weightedItems, totalWeight, yieldMapper))
+        equalizeMap(keyMappedItems)
+        val groupedItems = convertToKeyValueList(keyMappedItems)
+        return CachingSequence(droppedValues + generateShuffledSequence(groupedItems, yieldMapper))
     }
 
     private fun <ItemT, KeyT> convertToMap(values: List<ItemT>, usingKey: (ItemT) -> KeyT): Map<KeyT, MutableList<IndexedValue<ItemT>>> {
@@ -120,60 +123,82 @@ object WeightedShuffle {
         }
     }
 
-    //todo It'd be nice if I could make these immutable...
-    private fun <ItemT, KeyT> convertToWeightedPairs(map: Map<KeyT, MutableList<IndexedValue<ItemT>>>, totalCount: Int, totalWeight: Long): MutableList<WeightedValue<MutableList<IndexedValue<ItemT>>>> {
-        /*A list were we assign weights to all of the items we made before in the map. The weights are determined by
-          how many items we have in the list.*/
-        val weightedList = mutableListOf<WeightedValue<MutableList<IndexedValue<ItemT>>>>()
-        map.forEach {
-            val weight = Math.ceil((it.value.size.toDouble() / totalCount) * totalWeight).toLong()
-            weightedList.add(WeightedValue(weight, it.value))
+    private fun <ItemT, KeyT> equalizeMap(unequalizedMap: Map<KeyT, MutableList<IndexedValue<ItemT>>>) {
+        val maxItemCount = unequalizedMap.maxBy { it.value.size }?.value?.size
+                ?: throw IllegalStateException("For some reason, the weighted list doesn't have a max....? This is a huge bug.")
+        unequalizedMap.forEach {
+            val size = it.value.size
+            val firstItem = it.value.first().value
+            if (size < maxItemCount) it.value.addAll((size until maxItemCount).map { IndexedValue(-1, firstItem) })
         }
-        //A good shuffle so that we don't always end up starting with the same few items.
-        weightedList.shuffle()
-        return weightedList
+
     }
 
-    private fun <ItemT, YieldT> generateShuffledSequence(weightedList: MutableList<WeightedValue<MutableList<IndexedValue<ItemT>>>>, totalWeight: Long, yieldMapper: (IndexedValue<ItemT>) -> YieldT): Sequence<YieldT> {
+    //todo It'd be nice if I could make these immutable...
+    private fun <ItemT, KeyT> convertToKeyValueList(map: Map<KeyT, MutableList<IndexedValue<ItemT>>>): MutableList<KeyValue<MutableList<IndexedValue<ItemT>>, KeyT>> {
+        /*A list were we assign weights to all of the items we made before in the map. The weights are determined by
+          how many items we have in the list.*/
+        val keyValueList = mutableListOf<KeyValue<MutableList<IndexedValue<ItemT>>, KeyT>>()
+        map.forEach {
+            keyValueList.add(KeyValue(it.key, it.value))
+        }
+        //A good shuffle so that we don't always end up starting with the same few items.
+        keyValueList.shuffle()
+        return keyValueList
+    }
+
+    private fun <ItemT, YieldT, KeyT> generateShuffledSequence(groupedItems: MutableList<KeyValue<MutableList<IndexedValue<ItemT>>, KeyT>>, yieldMapper: (IndexedValue<ItemT>) -> YieldT): Sequence<YieldT> {
         return buildSequence {
-            var currentTotalWeight = totalWeight
             var shouldContinue: Boolean //Whether we have more items to add or if we can safely quit.
-            var currentWeightedListIndex = -1 //Where we currently are in [weightedList]
+            var currentGroupedItemsIndex: Int //Where we currently are in [groupedItems]
+            val cacheCapacity = Math.max((groupedItems.size * .75).toInt(), 1)
+            val randomInstance = Random()
+
+            val recentlySelectedItems = Builder.build<KeyT, Any> {
+                policy = FIFO
+                capacity = cacheCapacity
+            }
+
             do {
-                currentWeightedListIndex += 1
-                if (currentWeightedListIndex >= weightedList.size) currentWeightedListIndex = 0 //Go from the beginning of weightedList if we're at the end.
+                currentGroupedItemsIndex = randomInstance.nextInt(groupedItems.size)
 
-                val currentWeightedValue = weightedList[currentWeightedListIndex]
-                val currentItems = currentWeightedValue.item
-                val currentWeight = currentWeightedValue.weight
+                val currentWeightedKeyValue = groupedItems[currentGroupedItemsIndex]
+                val currentItems = currentWeightedKeyValue.value
 
-                if (currentItems.isEmpty()) { //If our current items are empty, decide if we should continue or quit.
-                    shouldContinue = weightedList.any { it.item.isNotEmpty() }
-                    if (shouldContinue) {
-                        currentTotalWeight -= currentWeight
-                        continue
-                    } else return@buildSequence
-                }
                 // Should we attempt to add a item from currentItems to our chosen indexes.
-                val shouldAdd = shouldAddItem(currentWeightedValue, currentTotalWeight)
+                val shouldAdd = shouldAddItem(currentWeightedKeyValue, recentlySelectedItems)
 
                 if (shouldAdd) {
                     val chosenIndex = (Math.random() * currentItems.size).toInt() //We're gonna add a item! Choose a random one from currentItems
-                    yield(yieldMapper(currentItems[chosenIndex]))
+                    val chosenItem = currentItems[chosenIndex]
+                    val currentKey = currentWeightedKeyValue.key
                     currentItems.removeAt(chosenIndex) //Remove it from our currentItems list so we don't choose it again.
-                    weightedList[currentWeightedListIndex] = WeightedValue(currentWeight, currentItems) //Set the new currentItems (which is sans the item we added) back to the weightedList so we don't choose it again.
+                    if (currentItems.isEmpty()) {
+                        groupedItems.removeAt(currentGroupedItemsIndex) // No longer look for this list
+                    } else {
+                        groupedItems[currentGroupedItemsIndex] = KeyValue(currentKey, currentItems) //Set the new currentItems (which is sans the item we added) back to the groupedItems so we don't choose it again.
+                    }
+                    if (chosenItem.index >= 0) {
+                        recentlySelectedItems.put(currentKey, 0)
+                        yield(yieldMapper(chosenItem))
+                    }
                 }
-                shouldContinue = !shouldAdd || currentItems.isNotEmpty() || weightedList.any { it.item.isNotEmpty() } //Are there any more items we can add?
+                shouldContinue = !shouldAdd || currentItems.isNotEmpty() || groupedItems.any { it.value.isNotEmpty() } //Are there any more items we can add?
             } while (shouldContinue)
         }
     }
 
-    private fun <ItemT> shouldAddItem(item: WeightedValue<ItemT>, totalWeight: Long): Boolean {
-        if (item.skippedCount >= totalWeight * .15) //A fallback for extreme cases.
-            return true
-        //Choose a random number between 0 and totalWeight and decide to add a item from currentItems based on the result.
-        return (Math.random() * totalWeight <= item.weight).also {
-            if (!it) item.skippedCount += 1
+    private fun <KeyT> shouldAddItem(item: KeyValue<*, KeyT>, cache: Kache<KeyT, Any>): Boolean {
+        return when {
+            cache.get(item.key) == null -> true
+            cache.get(item.key) != null && item.skippedCount > cache.getMaxSize() -> {
+                cache.remove(item.key)
+                true
+            }
+            else -> {
+                item.skippedCount += 1
+                false
+            }
         }
     }
 
